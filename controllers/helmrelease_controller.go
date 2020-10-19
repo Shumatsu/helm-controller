@@ -38,6 +38,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 	kuberecorder "k8s.io/client-go/tools/record"
 	"k8s.io/client-go/tools/reference"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -291,7 +292,11 @@ func (r *HelmReleaseReconciler) reconcileChart(ctx context.Context, hr *v2.HelmR
 func (r *HelmReleaseReconciler) reconcileRelease(ctx context.Context, log logr.Logger,
 	hr v2.HelmRelease, chart *chart.Chart, values chartutil.Values) (v2.HelmRelease, error) {
 	// Initialize Helm action runner
-	run, err := runner.NewRunner(r.Config, hr.GetReleaseNamespace(), hr.GetNamespace(), r.Log)
+	kubeConfig, err := r.getKubeConfig(ctx, hr)
+	if err != nil {
+		return v2.HelmReleaseNotReady(hr, v2.InitFailedReason, err.Error()), err
+	}
+	run, err := runner.NewRunner(kubeConfig, hr.GetReleaseNamespace(), hr.GetNamespace(), r.Log)
 	if err != nil {
 		return v2.HelmReleaseNotReady(hr, v2.InitFailedReason, "failed to initialize Helm action runner"), err
 	}
@@ -448,6 +453,25 @@ func (r *HelmReleaseReconciler) checkDependencies(hr v2.HelmRelease) error {
 		}
 	}
 	return nil
+}
+
+func (r *HelmReleaseReconciler) getKubeConfig(ctx context.Context, hr v2.HelmRelease) (*rest.Config, error) {
+	if hr.Spec.KubeConfig == nil {
+		return r.Config, nil
+	}
+	secretName := types.NamespacedName{
+		Namespace: hr.GetNamespace(),
+		Name:      hr.Spec.KubeConfig.SecretRef.Name,
+	}
+	var secret corev1.Secret
+	if err := r.Get(ctx, secretName, &secret); err != nil {
+		return nil, fmt.Errorf("could not find KubeConfig secret '%s': %w", secretName, err)
+	}
+	kubeConfig, ok := secret.Data["value"]
+	if !ok {
+		return nil, fmt.Errorf("KubeConfig secret '%s' does not contain a 'value' key", secretName)
+	}
+	return clientcmd.RESTConfigFromKubeConfig(kubeConfig)
 }
 
 // composeValues attempts to resolve all v2beta1.ValuesReference resources
@@ -618,7 +642,11 @@ func (r *HelmReleaseReconciler) garbageCollectHelmChart(ctx context.Context, hr 
 // garbageCollectHelmRelease uninstalls the deployed Helm release of
 // the given v2beta1.HelmRelease.
 func (r *HelmReleaseReconciler) garbageCollectHelmRelease(logger logr.Logger, hr v2.HelmRelease) error {
-	run, err := runner.NewRunner(r.Config, hr.GetReleaseNamespace(), hr.GetNamespace(), logger)
+	kubeConfig, err := r.getKubeConfig(context.TODO(), hr)
+	if err != nil {
+		return err
+	}
+	run, err := runner.NewRunner(kubeConfig, hr.GetReleaseNamespace(), hr.GetNamespace(), logger)
 	if err != nil {
 		return err
 	}
